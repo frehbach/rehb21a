@@ -1,0 +1,393 @@
+---
+title: "02DataModelling"
+author: "FR"
+date: "05/03/2021"
+output: html_document
+---
+
+## Setup data paths
+```{r}
+expPath <- "expResults/exAuto1604/"
+curveDf <- data.frame("batchSize" = c(8,4,2,1), "s" = c(1,1.7,3,5.3))
+nCores <- 10
+
+library(SPOT)
+library(flacco)
+library(dplyr)
+library(randomForest)
+require(pbapply)
+require(pbmcapply)
+```
+
+
+## Gathering the points from evaluated algo runs
+```{r}
+if(!file.exists("expResults/exdataWithX.rds")){
+    source("helperScriptsFunctions/readBBOB.R")
+    source("helperScriptsFunctions/bbobResultAnalysis.R")
+    
+    df <- readBBOB(expPath)
+    df <- applyFrNamingScheme(df, keepX = TRUE, keepY = TRUE)
+    df <- df %>% select(-"seed")
+    df$realY <- df$`df[, startsWith(names(df), "measuredFitnes")]`
+    df <- df %>% select(-'df[, startsWith(names(df), "measuredFitnes")]')
+    
+    variablesInAlgoName = c("seed","functionID","algoID","nDim","budget","batchSize")
+    algorithmIDsToReplace = c(1,2,3,4,5,6,7,8,9,10,12,13)
+    algorithmNamesToInsert = c("RandomSearch",
+                               "SPOT",
+                               "DIRECT",
+                               "1+1ES",
+                               "moimbo",
+                               "Q-EI",
+                               "IPI",
+                               "CMAES",
+                               "DE",
+                               "BOBYQA",
+                               "NEWUOA",
+                               "MultiLocalEI")
+    
+    df <- appendVariablesByAlgoName(df, variablesInAlgoName)
+    df$algName <- replaceConfigVector(df$algoID, algorithmIDsToReplace, algorithmNamesToInsert)
+    df$nDim <- as.numeric(as.character(df$nDim))
+    df <- unique(df)
+    
+    saveRDS(df,file = "expResults/exdataWithX.rds")
+}
+df <- readRDS("expResults/exdataWithX.rds")
+```
+
+## Preparing data removing nas etc
+```{r}
+removeNACols <- function(df){
+    df[, colSums(is.na(df)) != nrow(df)]
+}
+
+df <- df %>% filter(algName == "MultiLocalEI")
+df <- df %>% filter(batchSize != "1")
+df <- removeNACols(df)
+
+df$iteration <- trunc((df$iteration-1) / as.numeric(df$batchSize)) + 1
+df$unitTime <- as.numeric(df$iteration)
+df$batchSize <- as.numeric(df$batchSize)
+for(bs in curveDf$batchSize){
+    df$unitTime[df$batchSize == bs] <- df$unitTime[df$batchSize == bs] / curveDf$s[curveDf$batchSize == bs]
+}
+
+df <- df[df$unitTime <= 50, ]
+df <- df[df$batchSize != 4,]
+
+getBestConfigBySeed <- function(g,...){
+    filtered <- g %>% group_by(batchSize) %>% slice(tail(row_number(), 1)) %>% 
+        group_by(batchSize) %>% mutate(med = median(y))
+    g$bestBatchSizeBySeed <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    return(g)
+}
+
+getBestConfig <- function(g,...){
+    filtered <- g %>% group_by(batchSize,seed) %>% slice(tail(row_number(), 1)) %>% 
+        group_by(batchSize) %>% mutate(med = median(y))
+    #g$bestBatchSize <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    g$bestBatchSize <- mean(g$bestBatchSizeBySeed)
+    return(g)
+}
+
+getBestMedianConfig <- function(g,...){
+    filtered <- g %>% group_by(batchSize,seed) %>% slice(tail(row_number(), 1)) %>% 
+        group_by(batchSize) %>% mutate(med = median(y))
+    #g$bestBatchSize <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    g$bestMedianBatchSize <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    return(g)
+}
+
+df <- df %>% group_by(functionID, nDim, algName, algoID) %>% group_modify(getBestMedianConfig)
+df <- df %>% group_by(functionID, nDim, algName, algoID, seed) %>% group_modify(getBestConfigBySeed)
+df <- df %>% group_by(functionID, nDim, algName, algoID) %>% group_modify(getBestConfig)
+
+df$functionID <- as.numeric(as.character(df$functionID))
+```
+
+## calculating the features on that data
+```{r, echo=FALSE, warning=FALSE}
+getFeatures <- function(g, ...){
+    gX <- removeNACols(g[,startsWith(names(g),"x")])
+    gX <- as.matrix(gX)
+    fObj <- createFeatureObject(X = gX, y = g$realY)
+    ctrl <- list(allow_cellmapping = FALSE, show_progress = F, 
+                             subset = c("basic","ela_meta",
+                                        "ic"))
+    features <- data.frame(calculateFeatures(fObj, control = ctrl))
+    features$functionID = g$functionID[1]
+    features$seed = g$seed[1]
+    features$nDim <- g$nDim[1]
+    return(features)
+}
+
+if(!file.exists("expResults/featDF.rds")){
+    featDF <- df %>% group_by(functionID, nDim, algName, algoID, batchSize, seed) %>% group_modify(getFeatures)
+    saveRDS(featDF, file = "expResults/featDF.rds")
+}
+
+featDF <- readRDS("expResults/featDF.rds")
+```
+
+## Build a data set with features and prediction results
+```{r}
+prepareAnalysisDf <- function(df, featDF){
+    sliceDf <- df %>% group_by(functionID, nDim, algName, algoID, batchSize, seed) %>% slice(tail(row_number(), 1))
+    sliceDf <- sliceDf[,-which(startsWith(names(sliceDf),"x"))]
+    sliceDf <- sliceDf[, -which(names(sliceDf) %in% c("y", "iteration", "unitTime", "budget"))]
+    featDF$functionID <- as.numeric(as.character(featDF$functionID))
+    
+    analysisDf <- full_join(sliceDf, featDF)
+    analysisDf <- analysisDf[, -c(12:25)]
+    
+    completeAnalysisDF <- do.call(data.frame,lapply(analysisDf, function(x) replace(x, is.infinite(x),NA)))
+    completeAnalysisDF <- completeAnalysisDF[complete.cases(completeAnalysisDF),]
+    completeAnalysisDF$bestMedianBatchSize <- as.factor(completeAnalysisDF$bestMedianBatchSize)
+    completeAnalysisDF$seed <- as.numeric(as.character(completeAnalysisDF$seed))
+    completeAnalysisDF <- completeAnalysisDF[,!grepl("costs",names(completeAnalysisDF))]
+    return(completeAnalysisDF)
+}
+
+completeAnalysisDF <- prepareAnalysisDf(df, featDF)
+saveRDS(completeAnalysisDF,"expResults/completeAnalysisDF.rds")
+```
+
+## Feature selection with caret
+```{r}
+# ensure the results are repeatable
+set.seed(7)
+# load the library
+library(mlbench)
+library(caret)
+
+# load the data
+X <- completeAnalysisDF[,11:25]
+y <- completeAnalysisDF$bestMedianBatchSize
+
+index <- list()
+xFunID <- completeAnalysisDF$functionID
+for(i in 1:24){
+    trainFuns <- c(1:24)[-i]
+    trainInd <- which(xFunID %in% trainFuns)
+    index <- c(index, list(trainInd))
+}
+
+unique(completeAnalysisDF[index[[1]],]$seed)
+
+library(doParallel)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv", index = index)
+
+# run the RFE algorithm
+results <- rfe(X, y, sizes=c(1:10), rfeControl=control, metric = "Kappa")
+
+stopCluster(cl)
+
+# summarize the results
+print(results)
+# list the chosen features
+predictors(results)
+# plot the results
+plot(results, type=c("g", "o"))
+```
+## Get Random Accuracy for Kappa value
+```{r}
+randAcc <- NULL
+
+for(i in 1:10){
+    Xsub <- completeAnalysisDF[, which(names(completeAnalysisDF) %in% predictors(results))]
+    iid <- completeAnalysisDF$seed
+    y <- completeAnalysisDF$bestMedianBatchSize
+    
+    trainInd <- sample(unique(iid), size = 0.75*length(unique(iid)), replace = F)
+    testInd <- (1:max(unique(iid)))[-trainInd]
+    
+    rf <- randomForest(x = Xsub[completeAnalysisDF$seed %in% trainInd,], 
+                       y = y[completeAnalysisDF$seed %in% trainInd], 
+                       na.action = na.omit)
+    
+    y <- sample(y)
+    
+    yPred <- predict(rf, Xsub[completeAnalysisDF$seed %in% testInd,])
+    lAcc <- sum(yPred == y[completeAnalysisDF$seed %in% testInd])/sum(completeAnalysisDF$seed %in% testInd)
+    randAcc <- c(randAcc, lAcc)
+}
+print(randAcc)
+randAcc <- mean(randAcc)
+print(randAcc)
+
+getKappa <- function(p, pc){
+    return(
+        (p-pc) / (1-pc)
+    )
+}
+```
+
+
+
+## Build and test a random forest with the proposed predictors (Level 1 - easy - completly random selection)
+```{r}
+Xsub <- completeAnalysisDF[, which(names(completeAnalysisDF) %in% predictors(results))]
+iid <- completeAnalysisDF$seed
+y <- completeAnalysisDF$bestMedianBatchSize
+
+trainInd <- sample(unique(iid), size = 0.75*length(unique(iid)), replace = F)
+testInd <- (1:max(unique(iid)))[-trainInd]
+#trainInd <- completeAnalysisDF$seed %in% trainInd
+#testInd <- completeAnalysisDF$seed %in% testInd
+
+rf <- randomForest(x = Xsub[completeAnalysisDF$seed %in% trainInd,], 
+                   y = y[completeAnalysisDF$seed %in% trainInd], 
+                   na.action = na.omit)
+rf
+
+yPred <- predict(rf, Xsub[completeAnalysisDF$seed %in% testInd,])
+testAcc <- sum(yPred == y[completeAnalysisDF$seed %in% testInd])/sum(completeAnalysisDF$seed %in% testInd)
+print(paste("Test accuracy:", testAcc))
+print(paste("Test kappa:", getKappa(testAcc, randAcc)))
+```
+
+## Build and save a model for later use
+```{r}
+trainCols <- names(Xsub)
+rf <- randomForest(x = Xsub, 
+                   y = y, 
+                   na.action = na.omit)
+
+saveRDS(object = list("rf"=rf, "trainCols"=trainCols), file = "expResults/autoRF.rds")
+```
+
+## Simulation Setup
+```{r}
+expPath <- "expResults/exAuto2704/"
+```
+
+## Gathering the points from evaluated algo runs
+
+```{r setup, include=FALSE}
+    source("helperScriptsFunctions/readBBOB.R")
+    source("helperScriptsFunctions/bbobResultAnalysis.R")
+    
+    df <- readBBOB(expPath, filterString = "13Multi")
+    df$funID <- as.numeric(as.character(df$funID))
+    df <- df[df$funID > 24,]
+    
+    df <- applyFrNamingScheme(df, keepX = TRUE, keepY = TRUE)
+    df <- df %>% select(-"seed")
+    df$realY <- df$`df[, startsWith(names(df), "measuredFitnes")]`
+    df <- df %>% select(-'df[, startsWith(names(df), "measuredFitnes")]')
+    
+    variablesInAlgoName = c("seed","functionID","algoID","nDim","budget","batchSize")
+    algorithmIDsToReplace = c(1,2,3,4,5,6,7,8,9,10,12,13,14)
+    algorithmNamesToInsert = c("RandomSearch",
+                               "SPOT",
+                               "DIRECT",
+                               "1+1ES",
+                               "moimbo",
+                               "Q-EI",
+                               "IPI",
+                               "CMAES",
+                               "DE",
+                               "BOBYQA",
+                               "NEWUOA",
+                               "MultiLocalEI",
+                               "AutoMultiLocalEI")
+    
+    df <- appendVariablesByAlgoName(df, variablesInAlgoName)
+    df$algName <- replaceConfigVector(df$algoID, algorithmIDsToReplace, algorithmNamesToInsert)
+    df$nDim <- as.numeric(as.character(df$nDim))
+    df <- unique(df)
+```
+
+
+## Preparing data removing nas etc
+```{r}
+removeNACols <- function(df){
+    df[, colSums(is.na(df)) != nrow(df)]
+}
+
+df <- df %>% filter(algName == "MultiLocalEI")
+df <- df %>% filter(batchSize != "1")
+df <- removeNACols(df)
+
+df$iteration <- trunc((df$iteration-1) / as.numeric(df$batchSize)) + 1
+df$unitTime <- as.numeric(df$iteration)
+df$batchSize <- as.numeric(df$batchSize)
+for(bs in curveDf$batchSize){
+    df$unitTime[df$batchSize == bs] <- df$unitTime[df$batchSize == bs] / curveDf$s[curveDf$batchSize == bs]
+}
+
+df <- df[df$unitTime <= 50, ]
+df <- df[df$batchSize != 4,]
+
+getBestMedianConfig <- function(g,...){
+    filtered <- g %>% group_by(batchSize,seed) %>% slice(tail(row_number(), 1)) %>% 
+        group_by(batchSize) %>% mutate(med = median(y))
+    #g$bestBatchSize <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    g$bestMedianBatchSize <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    return(g)
+}
+
+df <- df %>% group_by(functionID, nDim, algName, algoID) %>% group_modify(getBestMedianConfig)
+
+getBestConfigBySeed <- function(g,...){
+    filtered <- g %>% group_by(batchSize) %>% slice(tail(row_number(), 1)) %>% 
+        group_by(batchSize) %>% mutate(med = median(y))
+    g$bestBatchSizeBySeed <- as.numeric(max(filtered$batchSize[filtered$med == min(filtered$med)]))
+    return(g)
+}
+
+df <- df %>% group_by(functionID, nDim, algName, algoID, seed) %>% group_modify(getBestConfigBySeed)
+
+
+df$functionID <- as.numeric(as.character(df$functionID))
+```
+
+## calculating the features on that data
+```{r, echo=FALSE, warning=FALSE}
+getFeatures <- function(g, ...){
+    gX <- removeNACols(g[,startsWith(names(g),"x")])
+    gX <- as.matrix(gX)
+    fObj <- createFeatureObject(X = gX, y = g$realY)
+    ctrl <- list(allow_cellmapping = FALSE, show_progress = F, 
+                             subset = c("basic","ela_meta",
+                                        "ic"))
+    features <- data.frame(calculateFeatures(fObj, control = ctrl))
+    features$functionID = g$functionID[1]
+    features$seed = g$seed[1]
+    features$nDim <- g$nDim[1]
+    return(features)
+}
+
+groupList <- df %>% group_by(functionID, nDim, algName, algoID, batchSize, seed) %>% group_split()
+featDF <- bind_rows(pbmcapply::pbmclapply(groupList, getFeatures, mc.cores = nCores)) 
+
+```
+
+## Build a data set with features and prediction results
+```{r}
+prepareAnalysisDf <- function(df, featDF){
+    sliceDf <- df %>% group_by(functionID, nDim, algName, algoID, batchSize, seed) %>% slice(tail(row_number(), 1))
+    sliceDf <- sliceDf[,-which(startsWith(names(sliceDf),"x"))]
+    sliceDf <- sliceDf[, -which(names(sliceDf) %in% c("y", "iteration", "unitTime", "budget"))]
+    featDF$functionID <- as.numeric(as.character(featDF$functionID))
+    
+    analysisDf <- full_join(sliceDf, featDF)
+    analysisDf <- analysisDf[, -c(10:23)]
+    
+    completeAnalysisDF <- do.call(data.frame,lapply(analysisDf, function(x) replace(x, is.infinite(x),NA)))
+    completeAnalysisDF <- completeAnalysisDF[complete.cases(completeAnalysisDF),]
+    completeAnalysisDF$bestMedianBatchSize <- as.factor(completeAnalysisDF$bestMedianBatchSize)
+    completeAnalysisDF$seed <- as.numeric(as.character(completeAnalysisDF$seed))
+    completeAnalysisDF <- completeAnalysisDF[,!grepl("costs",names(completeAnalysisDF))]
+    return(completeAnalysisDF)
+}
+df$functionID <- as.numeric(as.character(df$functionID))
+completeAnalysisDF <- prepareAnalysisDf(df, featDF)
+saveRDS(completeAnalysisDF,"expResults/completeSimulatedAnalysisDF.rds")
+```

@@ -1,0 +1,283 @@
+## used
+
+---
+title: "04TableLookUpNearest"
+author: "FR"
+date: "06/04/2021"
+output: html_document
+---
+
+## This document looks at the prediction accuracy of different methods with varying amounts of samples
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(smoof)
+require(dplyr)
+require(multidplyr)
+require(parallel)
+require(pbapply)
+require(pbmcapply)
+library(flacco)
+library(randomForest)
+library(cluster)
+library(ggplot2)
+library(reshape)
+
+set.seed(7)
+nDim = 5
+nCores <- 10
+
+#predictors <- c("ela_meta.quad_w_interact.adj_r2",
+#                "ela_meta.quad_simple.adj_r2",
+#                "ic.eps.s",
+#                "ic.eps.max",
+#                "ela_distr.skewness")
+rfLoad <- readRDS("autoRF.rds")
+predictors <- rfLoad$trainCols
+```
+
+## Predictors are taken from previous RFE
+```{r}
+print(predictors)
+```
+
+## Generating 2000 samples on each fid and 10 instances
+```{r}
+## Generate samples for all experiments
+nSamples <- 2000
+X <- matrix(runif(nSamples*nDim,min = -5, max = 5), ncol = 5)
+listOfData <- list()
+for(i in 1:24){
+    for(j in 1:10){
+        fun <- smoof::makeBBOBFunction(dimensions = nDim, fid = i, iid = j)
+        results <- fun(t(X))
+        listOfData[[length(listOfData) + 1]] <- data.frame(X, results, nDim, "fid" = i, iid = j, rowID = 1:nSamples)
+    }
+}
+allData <- bind_rows(listOfData)
+rm(listOfData)
+```
+
+```{r, echo=FALSE}
+removeNACols <- function(df){
+    df[, colSums(is.na(df)) != nrow(df)]
+}
+
+getFeatures <- function(g, ...){
+    gX <- removeNACols(g[,startsWith(names(g),"X")])
+    gX <- as.matrix(gX)
+    fObj <- createFeatureObject(X = gX, y = g$results)
+    ctrl <- list(allow_cellmapping = FALSE, show_progress = F, 
+                             subset = c("basic","ela_meta",
+                                        "ic"))
+    features <- data.frame(calculateFeatures(fObj, control = ctrl))
+    features$nDim <- g$nDim[1]
+        features$fid <- g$fid[1]
+        features$iid <- g$iid[1]
+    return(features)
+}
+```
+
+```{r}
+addFunGroup <- function(completeAnalysisDF){
+    completeAnalysisDF$funGroup <- ""
+    completeAnalysisDF$funGroup[completeAnalysisDF$fid < 6] <- "Separable"
+    completeAnalysisDF$funGroup[completeAnalysisDF$fid < 10 & completeAnalysisDF$fid > 5] <- "lowCond"
+    completeAnalysisDF$funGroup[completeAnalysisDF$fid < 15 & completeAnalysisDF$fid > 9] <- "highCond"
+    completeAnalysisDF$funGroup[completeAnalysisDF$fid < 20 & completeAnalysisDF$fid > 14] <- "adeqGlobalStruct"
+    completeAnalysisDF$funGroup[completeAnalysisDF$fid > 19] <- "weakGlobalStruct"
+    
+    completeAnalysisDF$conditioned[completeAnalysisDF$fid == 1] <- "OK"
+    completeAnalysisDF$conditioned[completeAnalysisDF$fid == 2] <- "High-Cond"
+    completeAnalysisDF$conditioned[completeAnalysisDF$fid > 2 & completeAnalysisDF$fid < 10] <- "OK"
+    completeAnalysisDF$conditioned[completeAnalysisDF$fid > 9 & completeAnalysisDF$fid < 15] <- "High-Cond"
+    completeAnalysisDF$conditioned[completeAnalysisDF$fid > 14] <- "OK"
+    
+    completeAnalysisDF <- do.call(data.frame,lapply(completeAnalysisDF, function(x) replace(x, is.infinite(x),NA)))
+    completeAnalysisDF <- completeAnalysisDF[complete.cases(completeAnalysisDF),]
+    return(completeAnalysisDF)
+}
+```
+
+
+```{r}
+rfTest <- function(df){
+    Xsub <- df[, which(names(df) %in% predictors)]
+    y <- completeAnalysisDF$funGroup
+
+    trainInd <- sample(1:nrow(Xsub), size = 0.75*nrow(Xsub), replace = F)
+    testInd <- c(1:nrow(Xsub))[-trainInd]
+    
+    rf <- randomForest(x = Xsub[trainInd,], 
+                       y = y[trainInd], 
+                       na.action = na.omit)
+    rf
+    
+    yPred <- predict(rf, Xsub[testInd,])
+    
+    return(sum(yPred == y[testInd])/length(testInd))
+}
+```
+
+```{r}
+rfCond <- function(df){
+    Xsub <- df[, which(names(df) %in% predictors)]
+    y <- completeAnalysisDF$conditioned
+
+    trainInd <- sample(1:nrow(Xsub), size = 0.75*nrow(Xsub), replace = F)
+    testInd <- c(1:nrow(Xsub))[-trainInd]
+    
+    rf <- randomForest(x = Xsub[trainInd,], 
+                       y = y[trainInd], 
+                       na.action = na.omit)
+    rf
+    
+    yPred <- predict(rf, Xsub[testInd,])
+    
+    return(sum(yPred == y[testInd])/length(testInd))
+}
+```
+
+```{r}
+getAccMat <- function(m, nElements = NULL){
+    return(mean(apply(m, 2, max) / max(apply(m, 2, max))))
+}
+```
+
+
+```{r}
+kMeansGroups <- function(df){
+    Xsub <- df[, which(names(df) %in% predictors)]
+    cluRes <- kmeans(Xsub, 5)
+
+    accMatrix <- as.matrix(table(data.frame(df$funGroup, cluRes$cluster)))
+    getAccMat(accMatrix)
+}
+```
+
+```{r}
+kMeansFid <- function(df){
+    Xsub <- df[, which(names(df) %in% predictors)]
+    cluRes <- kmeans(Xsub, 24)
+
+    accMatrix <- as.matrix(table(data.frame(df$fid, cluRes$cluster)))
+    getAccMat(accMatrix)
+}
+```
+
+## calculating random accuracies:
+```{r}
+resultDf <- allData
+ 
+## Calculating features on it 
+groupList <- resultDf %>% group_by(fid, nDim, iid) %>% group_split()
+featureDF <- bind_rows(pbmcapply::pbmclapply(groupList, getFeatures, mc.cores = nCores))   
+completeAnalysisDF <- addFunGroup(featureDF)
+
+## randomize result columns
+completeAnalysisDF$fid <- sample(completeAnalysisDF$fid,length(completeAnalysisDF$fid))
+completeAnalysisDF$funGroup <- sample(completeAnalysisDF$funGroup,length(completeAnalysisDF$funGroup))
+
+rfAcc <- NULL
+for(i in 1:10){
+    completeAnalysisDF$fid <- sample(completeAnalysisDF$fid,length(completeAnalysisDF$fid))
+    completeAnalysisDF$funGroup <- sample(completeAnalysisDF$funGroup,length(completeAnalysisDF$funGroup))
+    rfAcc <- c(rfAcc, rfTest(completeAnalysisDF))
+}
+
+rfCondAcc <- NULL
+for(i in 1:10){
+    completeAnalysisDF$fid <- sample(completeAnalysisDF$fid,length(completeAnalysisDF$fid))
+    completeAnalysisDF$conditioned <- sample(completeAnalysisDF$conditioned,length(completeAnalysisDF$conditioned))
+    rfCondAcc <- c(rfCondAcc, rfTest(completeAnalysisDF))
+}
+
+kmGroupAcc <- NULL
+for(i in 1:10){
+    completeAnalysisDF$fid <- sample(completeAnalysisDF$fid,length(completeAnalysisDF$fid))
+    completeAnalysisDF$funGroup <- sample(completeAnalysisDF$funGroup,length(completeAnalysisDF$funGroup))
+    kmGroupAcc <- c(kmGroupAcc, kMeansGroups(completeAnalysisDF))
+}
+
+kmFidAcc <- NULL
+for(i in 1:10){
+    completeAnalysisDF$fid <- sample(completeAnalysisDF$fid,length(completeAnalysisDF$fid))
+    completeAnalysisDF$funGroup <- sample(completeAnalysisDF$funGroup,length(completeAnalysisDF$funGroup))
+    kmFidAcc <- c(kmFidAcc, kMeansFid(completeAnalysisDF))
+}
+
+randResultDF <- data.frame("rfAcc" = mean(rfAcc), 
+                           "rfCondAcc" = mean(rfCondAcc),
+                                               "kmGroupAcc" = mean(kmGroupAcc),
+                                               "kmFidAcc" = mean(kmFidAcc))
+randResultDF
+```
+## Calculating real accuracies
+
+```{r}
+checkAt <- c(25,seq(50,500,50), seq(600,1000,100), seq(1500,2000,500))
+
+sampResultDF <- NULL
+
+for(sampSize in checkAt){
+    ## Cutting samples to size
+    resultDf <- allData[allData$rowID <= sampSize,]
+ 
+    ## Calculating features on it 
+    print(paste("Calculating features for sampSize:", sampSize))
+    groupList <- resultDf %>% group_by(fid, nDim, iid) %>% group_split()
+    featureDF <- bind_rows(pbmcapply::pbmclapply(groupList, getFeatures, mc.cores = nCores))   
+    completeAnalysisDF <- addFunGroup(featureDF)
+    
+    rfAcc <- NULL
+    for(i in 1:10){
+        rfAcc <- c(rfAcc, rfTest(completeAnalysisDF))
+    }
+    
+    rfCondAcc <- NULL
+    for(i in 1:10){
+        rfCondAcc <- c(rfCondAcc, rfTest(completeAnalysisDF))
+    }
+    
+    kmGroupAcc <- NULL
+    for(i in 1:10){
+        kmGroupAcc <- c(kmGroupAcc, kMeansGroups(completeAnalysisDF))
+    }
+    
+    kmFidAcc <- NULL
+    for(i in 1:10){
+        kmFidAcc <- c(kmFidAcc, kMeansFid(completeAnalysisDF))
+    }
+    
+    sampResultDF <- rbind(sampResultDF, data.frame("rfAcc" = mean(rfAcc), 
+                                                   "rfCondAcc" = mean(rfCondAcc),
+                                                   "kmGroupAcc" = mean(kmGroupAcc),
+                                                   "kmFidAcc" = mean(kmFidAcc),
+                                                   "sampSize" = sampSize))
+}
+```
+
+
+## Cohens Kappa
+$$ \kappa = \frac{p_0 - p_c}{1-p_c}  $$
+
+```{r}
+getKappa <- function(p, pc){
+    return(
+        (p-pc) / (1-pc)
+    )
+}
+
+sampResultDF$rfAcc <- getKappa(sampResultDF$rfAcc, randResultDF$rfAcc)
+sampResultDF$kmGroupAcc <- getKappa(sampResultDF$kmGroupAcc, randResultDF$kmGroupAcc)
+sampResultDF$kmFidAcc <- getKappa(sampResultDF$kmFidAcc, randResultDF$kmFidAcc)
+
+melted = melt(sampResultDF, id=c("sampSize"))
+ggplot(data=melted, aes(x=sampSize, y=value, group = variable)) + 
+    geom_line(aes(color=variable)) + 
+    geom_point() +
+    xlab("samplePoints") + 
+    ylab("Kappa")
+
+```
+

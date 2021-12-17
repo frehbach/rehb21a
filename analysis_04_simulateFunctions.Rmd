@@ -1,0 +1,219 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Setup
+```{r}
+expPath <- "expResults/exAuto1604/"
+curveDf <- data.frame("batchSize" = c(8,4,2,1), "s" = c(1,1.7,3,5.3))
+nCores <- 10
+
+library(SPOT)
+library(flacco)
+library(dplyr)
+library(randomForest)
+require(pbapply)
+require(pbmcapply)
+require(COBBS)
+```
+
+
+
+## Gathering the points from evaluated algo runs
+
+```{r setup, include=FALSE}
+if(!file.exists("expResults/exdataWithX.rds")){
+    source("helperScriptsFunctions/readBBOB.R")
+    source("helperScriptsFunctions/bbobResultAnalysis.R")
+    
+    df <- readBBOB(expPath)
+    df <- applyFrNamingScheme(df, keepX = TRUE, keepY = TRUE)
+    df <- df %>% select(-"seed")
+    df$realY <- df$`df[, startsWith(names(df), "measuredFitnes")]`
+    df <- df %>% select(-'df[, startsWith(names(df), "measuredFitnes")]')
+    
+    variablesInAlgoName = c("seed","functionID","algoID","nDim","budget","batchSize")
+    algorithmIDsToReplace = c(1,2,3,4,5,6,7,8,9,10,12,13)
+    algorithmNamesToInsert = c("RandomSearch",
+                               "SPOT",
+                               "DIRECT",
+                               "1+1ES",
+                               "moimbo",
+                               "Q-EI",
+                               "IPI",
+                               "CMAES",
+                               "DE",
+                               "BOBYQA",
+                               "NEWUOA",
+                               "MultiLocalEI")
+    
+    df <- appendVariablesByAlgoName(df, variablesInAlgoName)
+    df$algName <- replaceConfigVector(df$algoID, algorithmIDsToReplace, algorithmNamesToInsert)
+    df$nDim <- as.numeric(as.character(df$nDim))
+    df <- unique(df)
+    
+    saveRDS(df,file = "expResults/exdataWithX.rds")
+}
+df <- readRDS("expResults/exdataWithX.rds")
+```
+
+
+```{r}
+library(plotly)
+removeNACols <- function(df){
+    df[, colSums(is.na(df)) != nrow(df)]
+}
+
+dfSetup <- expand.grid("fid" = 1:24, "nDim" = c(2,5), "seed" = 1)
+dfSetup <- split(dfSetup, seq(nrow(dfSetup)))
+
+createSim <- function(setup){
+  fid <- setup$fid
+  nDim <- setup$nDim
+  seed <- setup$seed
+  
+  fileName <- paste0("simulatedFunctions/cobbsSim_",fid,"_",nDim,"_",seed,".rds")
+  if(file.exists(fileName)) return()
+  
+  simData <- df[df$functionID == fid & df$nDim == nDim & df$seed == seed & df$batchSize == 8, ]
+  x <- simData[,startsWith(names(simData),"x")]
+  x <- removeNACols(x)
+  y <- matrix(simData$realY,ncol=1)
+  
+  mc  <- list(useLambda=T,thetaLower=1e-6,thetaUpper=1e12)
+  cntrl <- list(modelControl=mc,
+                model=gaussianProcessR2L,
+                nsim=1,
+                seed=1,
+                method="spectral",
+                Ncos = 100*nDim,
+                #method="decompose",xsim=matrix(c(runif(200,-32,32)),,1),
+                conditionalSimulation=F
+  )
+  ## generate model and functions
+  res <- generateCOBBS(x,y,cntrl)
+  saveRDS(res, fileName)
+}
+
+pbmcapply::pbmclapply(dfSetup, createSim, mc.cores = 15)
+```
+
+```{r}
+require(COBBS)
+## generate some data
+require(smoof)
+seed <- 1234
+fnbbob <- makeBBOBFunction(dimensions = 2, fid = 1, iid = 2)
+groundtruth <- function(x){
+  x=matrix(x,,2) 
+  apply(x,1,fnbbob)
+}
+lower = getLowerBoxConstraints(fnbbob)
+upper = getUpperBoxConstraints(fnbbob)
+dimension <- length(lower)
+set.seed(seed)
+
+## prepare an expression that will be run during the experiments
+## here: DE
+expr <- expression(
+  res <- DEinterface(fun = fnlog,lower=lower,upper=upper,control=list(funEvals=dimension*200,populationSize=dimension*20))
+)
+## run an experiments, with logging
+require(COBBS)
+resgt <- loggedExperiment(expr, groundtruth, 1,logx = TRUE)
+resgt <- resgt[1:(dimension*200),]
+x <- as.matrix(resgt[,c(4,5)])
+y <- as.matrix(resgt[,2,drop=F])
+
+## specify some model configuration
+mc  <- list(useLambda=FALSE,thetaLower=1e-6,thetaUpper=1e12)
+## and some configuration details for the simulation
+cntrl <- list(modelControl=mc,
+              nsim=1,
+              seed=seed,
+              method="spectral",
+              Ncos = 100*dimension,
+              #method="decompose",xsim=matrix(c(runif(200,-32,32)),,1),
+              conditionalSimulation=TRUE
+)
+## generate model and functions
+cobbsResult <- generateCOBBS(x,y,cntrl)
+cobbsResult$fit
+
+## plot trained model (predictor/estimatation and simulation), using SPOT package
+SPOT:::plotFunction(groundtruth,lower,upper)
+SPOT:::plotFunction(cobbsResult$estimation,lower,upper)
+SPOT:::plotFunction(cobbsResult$simulation[[1]],lower,upper)
+```
+
+```{r}
+require(COBBS)
+## generate some data
+require(smoof)
+seed <- 1234
+fnbbob <- makeBBOBFunction(dimensions = 2, fid = 1, iid = 2)
+groundtruth <- function(x){
+  x=matrix(x,,2) 
+  apply(x,1,fnbbob)
+}
+lower = getLowerBoxConstraints(fnbbob)
+upper = getUpperBoxConstraints(fnbbob)
+dimension <- length(lower)
+set.seed(seed)
+## prepare an expression that will be run during the experiments
+## here: DE
+expr <- expression(
+  res <- DEinterface(fun = fnlog,lower=lower,upper=upper,control=list(funEvals=dimension*200,populationSize=dimension*20))
+)
+## run an experiments, with logging
+resgt <- loggedExperiment(expr, groundtruth, 1,logx = TRUE)
+resgt <- resgt[1:(dimension*200),]
+x <- as.matrix(resgt[,c(4,5)])
+y <- as.matrix(resgt[,2,drop=F])
+## specify some model configuration
+mc  <- list(useLambda=F,thetaLower=1e-6,thetaUpper=1e12)
+## and some configuration details for the simulation
+cntrl <- list(modelControl=mc,
+              model=gaussianProcessRegression,
+              nsim=2,
+              seed=1,
+              method="spectral",
+              Ncos = 100*dimension,
+              #method="decompose",xsim=matrix(c(runif(200,-32,32)),,1),
+              conditionalSimulation=F
+)
+## generate model and functions
+cobbsResult <- generateCOBBS(x,y,cntrl)
+cobbsResult$fit
+
+## plot trained model (predictor/estimatation and simulation), using SPOT package
+SPOT:::plotFunction(groundtruth,lower,upper)
+SPOT:::plotFunction(cobbsResult$estimation,lower,upper,points1 = x)
+SPOT:::plotFunction(cobbsResult$simulation[[1]],lower,upper)
+SPOT:::plotFunction(cobbsResult$simulation[[2]],lower,upper)
+
+## 2 level 
+mc  <- list(useLambda=T,thetaLower=1e-6,thetaUpper=1e12)
+cntrl <- list(modelControl=mc,
+              model=gaussianProcessR2L,
+              nsim=3,
+              seed=1,
+              method="spectral",
+              Ncos = 100*dimension,
+              #method="decompose",xsim=matrix(c(runif(200,-32,32)),,1),
+              conditionalSimulation=F
+)
+## generate model and functions
+cobbsResult <- generateCOBBS(x,y,cntrl)
+cobbsResult$fit
+
+## plot trained model (predictor/estimatation and simulation), using SPOT package
+SPOT:::plotFunction(groundtruth,lower,upper)
+SPOT:::plotFunction(cobbsResult$estimation,lower,upper)#,points1 = x)
+SPOT:::plotFunction(cobbsResult$simulation[[1]],lower,upper)
+SPOT:::plotFunction(cobbsResult$simulation[[2]],lower,upper)
+SPOT:::plotFunction(cobbsResult$simulation[[3]],lower,upper)
+```
+
+

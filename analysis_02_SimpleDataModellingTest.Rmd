@@ -1,0 +1,182 @@
+## used
+
+---
+title: "03FeatureTests"
+author: "FR"
+date: "29/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(smoof)
+require(dplyr)
+require(multidplyr)
+require(parallel)
+require(pbapply)
+require(pbmcapply)
+library(flacco)
+
+# load the library
+library(mlbench)
+library(caret)
+library(doParallel)
+```
+
+## This document tries to validate the feature based prediction based on some randomly generated points evaluated on BBOB
+For this purpose, 500 uniform random samples are evaluated on the first 15 instances of each BBOB function.
+This data is then used in some model fitting experiments. 
+
+
+### Generating a lot of samples to generate the features off
+```{r}
+set.seed(7)
+nDim = 5
+nSamples <- 500
+nCores <- 10
+
+X <- matrix(runif(nSamples*nDim,min = -5, max = 5), ncol = 5)
+listOfData <- list()
+for(i in 1:24){
+    for(j in 1:15){
+        fun <- smoof::makeBBOBFunction(dimensions = nDim, fid = i, iid = j)
+        results <- fun(t(X))
+        listOfData[[length(listOfData) + 1]] <- data.frame(X, results, nDim, "fid" = i, iid = j, rowID = 1:nSamples)
+    }
+}
+resultDf <- bind_rows(listOfData)
+rm(listOfData)
+```
+
+### Calculating the feature set on the collected data
+```{r}
+removeNACols <- function(df){
+    df[, colSums(is.na(df)) != nrow(df)]
+}
+
+getFeatures <- function(g, ...){
+    gX <- removeNACols(g[,startsWith(names(g),"X")])
+    gX <- as.matrix(gX)
+    fObj <- createFeatureObject(X = gX, y = g$results)
+    ctrl <- list(allow_cellmapping = FALSE, show_progress = F, 
+                             subset = c("basic","ela_meta",
+                                        "ic"))
+    features <- data.frame(calculateFeatures(fObj, control = ctrl))
+    features$nDim <- g$nDim[1]
+        features$fid <- g$fid[1]
+        features$iid <- g$iid[1]
+    return(features)
+}
+
+groupList <- resultDf %>% group_by(fid, nDim, iid) %>% group_split()
+featureDF <- bind_rows(pbmcapply::pbmclapply(groupList, getFeatures, mc.cores = nCores))
+```
+
+## Add the function group and create completeAnalysisDF for prediction
+```{r}
+completeAnalysisDF <- featureDF
+completeAnalysisDF$funGroup <- ""
+completeAnalysisDF$funGroup[completeAnalysisDF$fid < 6] <- "Separable"
+completeAnalysisDF$funGroup[completeAnalysisDF$fid < 10 & completeAnalysisDF$fid > 5] <- "lowCond"
+completeAnalysisDF$funGroup[completeAnalysisDF$fid < 15 & completeAnalysisDF$fid > 9] <- "highCond"
+completeAnalysisDF$funGroup[completeAnalysisDF$fid < 20 & completeAnalysisDF$fid > 14] <- "adeqGlobalStruct"
+completeAnalysisDF$funGroup[completeAnalysisDF$fid > 19] <- "weakGlobalStruct"
+
+completeAnalysisDF <- do.call(data.frame,lapply(completeAnalysisDF, function(x) replace(x, is.infinite(x),NA)))
+completeAnalysisDF <- completeAnalysisDF[complete.cases(completeAnalysisDF),]
+completeAnalysisDF <- completeAnalysisDF[,!grepl("costs",names(completeAnalysisDF))]
+```
+
+## Find the best predictors by rfe
+```{r}
+# ensure the results are repeatable
+set.seed(5)
+
+
+# load the data
+X <- completeAnalysisDF[,c(14:28)]
+y <- as.factor(completeAnalysisDF$funGroup)
+
+index <- list()
+xFunID <- as.numeric(as.character(completeAnalysisDF$iid))
+for(i in 1:15){
+    trainFuns <- c(1:15)[-i]
+    trainInd <- which(xFunID %in% trainFuns)
+    index <- c(index, list(trainInd))
+}
+
+
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+
+# define the control using a random forest selection function
+control <- rfeControl(functions=rfFuncs, method="cv")#, index = index, verbose = T)
+
+# run the RFE algorithm
+results <- rfe(X, y, sizes=c(1:10), rfeControl=control, metric = "Kappa")
+
+stopCluster(cl)
+
+# summarize the results
+print(results)
+# list the chosen features
+predictors(results)
+# plot the results
+plot(results, type=c("g", "o"))
+```
+## Try to measure some distances between instances and between functions
+```{r}
+chosenPredictors <- c(predictors(results)[1:5],"fid")
+#X <- X[, which(names(X) %in% chosenPredictors)]
+#X <- BBmisc::normalize(X)#, method = "range") ## best normalization method should be considered?
+
+## function to calculate a summary on distances based on a given feature DF
+summaryDistDF <- function(featDf){
+    featDf <- featDf[,-which(names(featDf) == "fid")]
+    s <- summary(dist(featDf))
+    df <- t(data.frame(x=matrix(s),row.names=names(s)))
+    rownames(df) <- NULL
+    return(df)
+}
+
+distanceData <- completeAnalysisDF[,which(names(completeAnalysisDF) %in% chosenPredictors)]
+distanceData[,1:5] <- BBmisc::normalize(distanceData[,1:5])
+
+distDF <- NULL
+for(fid in unique(completeAnalysisDF$fid)){
+    subData <- distanceData[distanceData$fid==fid,]
+    distDF <- rbind(distDF, cbind(data.frame("fid" = fid), summaryDistDF(subData)))
+}
+
+distDF <- rbind(distDF, cbind(data.frame("fid" = 0), summaryDistDF(distanceData)))
+tail(distDF)
+```
+
+## Try to measure some distances between instances and between functions
+```{r}
+chosenPredictors <- c(predictors(results)[1:5],"funGroup")
+#X <- X[, which(names(X) %in% chosenPredictors)]
+#X <- BBmisc::normalize(X)#, method = "range") ## best normalization method should be considered?
+
+## function to calculate a summary on distances based on a given feature DF
+summaryDistDF <- function(featDf){
+    featDf <- featDf[,-which(names(featDf) == "funGroup")]
+    s <- summary(dist(featDf))
+    df <- t(data.frame(x=matrix(s),row.names=names(s)))
+    rownames(df) <- NULL
+    return(df)
+}
+
+distanceData <- completeAnalysisDF[,which(names(completeAnalysisDF) %in% chosenPredictors)]
+distanceData[,1:5] <- BBmisc::normalize(distanceData[,1:5])
+
+distDF <- NULL
+for(funGroup in unique(completeAnalysisDF$funGroup)){
+    subData <- distanceData[distanceData$funGroup==funGroup,]
+    distDF <- rbind(distDF, cbind(data.frame("funGroup" = funGroup), summaryDistDF(subData)))
+}
+
+distDF <- rbind(distDF, cbind(data.frame("funGroup" = 0), summaryDistDF(distanceData)))
+tail(distDF)
+```
+

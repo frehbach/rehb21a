@@ -1,0 +1,90 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+## Setup
+```{r}
+dataPath <- "expResults/exAuto1804/"
+
+library(dplyr)
+library(stringr)
+library(ggplot2)
+```
+
+## Data Reading
+```{r}
+files <- dir(dataPath)
+files <- files[endsWith(files,".csv")]
+
+readDFile <- function(f){
+    df <- read.csv(paste0(dataPath,f))[,-1]
+    splits <- str_split(f,"_")[[1]][c(2,3,5)]
+    df$seed <- as.numeric(splits[1])
+    df$functionID <- as.numeric(splits[2])
+    df$nDim <- as.numeric(splits[3])
+    return(df)
+}
+
+df <- bind_rows(lapply(files,readDFile))
+df <- df[df$functionID < 25,]
+```
+
+
+## Optional second df:
+```{r}
+dataPath <- "expResults/exAuto2704/"
+files <- dir(dataPath)
+files <- files[endsWith(files,".csv")]
+dfOpt <- bind_rows(lapply(files,readDFile))
+df <- rbind(df, dfOpt)
+
+df$batchedTime <- as.integer(df$time/20)*20
+
+df <- df %>% group_by(functionID, nDim, batchedTime) %>% mutate(meanBatchSize = mean(batchSize))
+df <- unique(df[, names(df) %in% c("functionID","nDim","batchedTime","meanBatchSize")])
+df$functionID <- as.numeric(as.character(df$functionID))
+df$simulated <- df$functionID > 24
+df$functionID[df$simulated] <- df$functionID[df$simulated] - 24
+df$simulated[df$simulated == TRUE] <- "Simulated" 
+df$simulated[df$simulated == "FALSE"] <- "BBOB" 
+```
+
+
+## Creating Plot
+```{r}
+analyDF <- readRDS("expResults/completeAnalysisDF.rds")
+simDF <- readRDS("expResults/completeSimulatedAnalysisDF.rds")
+analyDF <- analyDF[,-c(10:11)]
+analyDF <- rbind(analyDF, simDF)
+analyDF$meanBatchSize <- as.numeric(as.character(analyDF$bestMedianBatchSize))
+analyDF <- unique(analyDF[, names(analyDF) %in% c("functionID","nDim","meanBatchSize")])
+analyDF$batchedTime <- 450
+analyDF$simulated <- analyDF$functionID > 24
+
+analyDF <- analyDF[,names(df)]
+analyDF$functionID[analyDF$simulated] <- analyDF$functionID[analyDF$simulated] - 24
+
+analyDF$simulated[analyDF$simulated == TRUE] <- "Simulated" 
+
+
+
+analyDF$simulated[analyDF$simulated == "FALSE"] <- "BBOB" 
+
+plotDF <- bind_rows(df,analyDF)
+
+plotDF$nDim <- paste("Dimensions:", plotDF$nDim)
+
+pdf("imgResults/predictionPlot.pdf", width = 8,height = 6)
+ggplot(plotDF, aes(batchedTime, functionID)) +
+      geom_tile(aes(fill = plotDF$meanBatchSize), width = 20, height = 0.75) +
+      facet_grid(rows = vars(nDim),cols = vars(simulated)) +
+      #scale_y_discrete(breaks=c(1,5,10,15,20,24)) + 
+      scale_fill_gradientn(colors = c("red","grey90","blue")) + 
+      theme(text=element_text(size=16)) + 
+      ylab("BBOB Function ID") + xlab("Time") + labs("fill" = "")
+dev.off()
+```
+
+
+
+
